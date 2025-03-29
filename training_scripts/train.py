@@ -17,12 +17,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from configs import *
 from datasets import get_dataloaders
 from models import model_trainers
-from utils import (criterions,
-                   all_metrics,
-                   trainLogging,
-                   save_checkpoint,
-                   trainLogVisualizer,
-                   inferVisualizer)
+from utils import *
 
 from validation import Validator
 from test import Tester
@@ -59,6 +54,7 @@ def parse_args():
     parser.add_argument('--visualize', action = 'store_true', help = 'save visualizations of the training logs & random sample inference')
 
     return parser.parse_args()
+
 
 class Trainer:
     def __init__(self, train_data : DataLoader,
@@ -172,116 +168,122 @@ class Trainer:
             print(f"Best Validation Dice Score: {self.best_val_dice:.4f}")
         
 
-
-
-    
 def main():
     init_process_group(backend='nccl')
-
+    gpu_id = os.environ['LOCAL_RANK']
     args = parse_args().__dict__
 
-    if args['data_dir'] is None or '':
+    if not args['data_dir']:
         raise Exception("Data Directory is not provided")
 
     if not torch.cuda.is_available():
-        raise Exception("Cuda is not available, training on CPU is not Ideal")
-        
+        raise Exception("Cuda is not available, training on CPU is not ideal")
+    
+    multi_gpu = not args['single_gpu'] and torch.cuda.device_count() > 1
+
     all_config = allConfig(**args)
 
     config_filename = all_config.get_config_filename()
     all_config.save_config(all_config.all_configs_dir + config_filename)
 
-    checkpoint_dir = all_config.train_config['checkpoint_dir'] + config_filename
-    os.makedirs(checkpoint_dir, exist_ok = True)
+    checkpoint_dir = os.path.join(all_config.train_config['checkpoint_dir'], config_filename)
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
-    all_config.save_config(checkpoint_dir + '/config')
+    logger = file_logging(checkpoint_dir)
 
+    if gpu_id == 0:
+        logger.debug(f"Initialized process group with {torch.cuda.device_count() if multi_gpu else 1} GPUs.")
+        
+        logger.debug(f"Saved config details to {checkpoint_dir + '/config.json'}")
     
-
+    all_config.save_config(os.path.join(checkpoint_dir, 'config'))
+    
     train_config = trainConfig(**args)
     train_config.checkpoint_dir = checkpoint_dir
-
-    multi_gpu = not args['single_gpu']
-
-    if torch.cuda.device_count() == 1:
-        multi_gpu = False
-
-
-    trainDataloader, valDataloader = get_dataloaders(multi_gpu = multi_gpu,
-                                                     config = amosDatasetConfig(**args))
-
+    
+    
+    trainDataloader, valDataloader = get_dataloaders(multi_gpu=multi_gpu, config=amosDatasetConfig(**args))
+    if gpu_id == 0:
+        logger.debug("Loaded train and validation dataloaders")
+    
     labels = trainDataloader.dataset.labels
     labels_to_pixels = trainDataloader.dataset.label_to_pixel_value
-
-    # Model Initialization
-    model_trainer = model_trainers[train_config.model]()
     
-    # Loss Initialization
+    model_trainer = model_trainers[train_config.model]()
+    if gpu_id == 0:
+        logger.debug("Initialized model trainer")
+    
     if args['loss_list'] is not None:
         criterion = criterions['combined'](
-            loss_list = train_config.loss_list,
-            weights = train_config.weights,
-            labels = labels,
-            labels_to_pixels = labels_to_pixels
+            loss_list=train_config.loss_list,
+            weights=train_config.weights,
+            labels=labels,
+            labels_to_pixels=labels_to_pixels
         )
         train_config.loss = 'combined'
     else:
-        criterion = criterions[train_config.loss](labels = labels, labels_to_pixels = labels_to_pixels)
+        criterion = criterions[train_config.loss](labels=labels, labels_to_pixels=labels_to_pixels)
     
-    # Metric Initialization
     if train_config.metric == 'all':
-            metrics = [metric(labels = labels, labels_to_pixels = labels_to_pixels) for metric in all_metrics.values()]
-    else :
-        metrics = [all_metrics[train_config.metric](labels = labels, labels_to_pixels = labels_to_pixels)]
-
-    # Logger Initialization
-    logger = trainLogging(metrics = [metric.name for metric in metrics])
-
+        metrics = [metric(labels=labels, labels_to_pixels=labels_to_pixels) for metric in all_metrics.values()]
+    else:
+        metrics = [all_metrics[train_config.metric](labels=labels, labels_to_pixels=labels_to_pixels)]
+    if gpu_id == 0:
+        logger.debug("Initialized Loss and Metrics")
+    
+    train_logger = trainLogging(metrics=[metric.name for metric in metrics])
+    if gpu_id == 0:
+        logger.debug("Initialized training logger")
+    
     trainer = Trainer(
-        train_data = trainDataloader,
-        validator = Validator,
-        val_data = valDataloader,
-        trainer = model_trainer,
-        epochs = train_config.epochs,
-        criterion = criterion,
-        metrics = metrics,
-        train_logger = logger,
-        config_filename = config_filename,
-        multi_gpu = multi_gpu,
-        train_config = train_config
+        train_data=trainDataloader,
+        validator=Validator,
+        val_data=valDataloader,
+        trainer=model_trainer,
+        epochs=train_config.epochs,
+        criterion=criterion,
+        metrics=metrics,
+        train_logger=train_logger,
+        config_filename=config_filename,
+        multi_gpu=multi_gpu,
+        train_config=train_config
     )
-
+    if gpu_id == 0:
+        logger.debug("Initialized trainer")
+    
     trainer.train()
-
+    if gpu_id == 0:
+        logger.debug("Training completed")
+    
     if args['visualize']:
-        print("Visualizing Logs and Inference...")
-
+        if gpu_id == 0:
+            logger.debug("Starting visualization")
         tester = Tester(
-            test_data = valDataloader.dataset,
-            trainer = trainer,
-            criterion = criterion,
-            metrics = metrics,
-            checkpoint_path = train_config.checkpoint_dir + '/best_model.pth',
-
-            n_samples = 32,
-            batch_size = args['batch_size'],
-            random_seed = 42
+            test_data=valDataloader.dataset,
+            trainer=trainer,
+            criterion=criterion,
+            metrics=metrics,
+            checkpoint_path=os.path.join(train_config.checkpoint_dir, 'best_model.pth'),
+            n_samples=32,
+            batch_size=args['batch_size'],
+            random_seed=42
         )
-
         _, images, masks, preds = tester.infer()
+        
+        os.makedirs(os.path.join(train_config.checkpoint_dir, 'visualizations'), exist_ok=True)
+        log_visualizer = trainLogVisualizer(os.path.join(train_config.checkpoint_dir, 'train_logs.csv'))
+        log_visualizer.visualize(save_path=os.path.join(train_config.checkpoint_dir, 'visualizations/logs.png'))
+        
+        if gpu_id == 0:
+            logger.debug("Training log visualizations are saved.")
 
-        os.makedirs(train_config.checkpoint_dir + '/visualizations', exist_ok = True)
-
-        log_visualizer = trainLogVisualizer(train_config.checkpoint_dir + '/train_logs.csv')
-        log_visualizer.visualize(save_path = train_config.checkpoint_dir +  '/visualizations/logs.png')
-
-        infer_visualizer = inferVisualizer(criterion = criterion)
-        infer_visualizer.visualize_batch(images = images,
-                                         masks = masks,
-                                         preds = preds,
-                                         save_path = train_config.checkpoint_dir + '/visualizations/infer.png')
-
+        infer_visualizer = inferVisualizer(criterion=criterion)
+        infer_visualizer.visualize_batch(images, masks, preds, save_path=os.path.join(train_config.checkpoint_dir, 'visualizations/infer.png'))
+        
+        if gpu_id == 0:
+            logger.debug("Inference Visualizations are saved.")
     destroy_process_group()
+
     
 if __name__ == "__main__":
     main()

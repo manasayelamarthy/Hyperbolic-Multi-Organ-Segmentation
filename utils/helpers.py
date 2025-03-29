@@ -1,6 +1,7 @@
 import torch
 from torch import nn
-
+import logging 
+import os
 import pandas as pd
 
 def save_checkpoint(model: nn.Module, optimizers, epoch: int, filename: str, multi_gpu):
@@ -18,3 +19,22 @@ def load_checkpoint(model: nn.Module, optimizers, filename: str):
     for optimizer, state_dict in zip(optimizers, checkpoint['optimizers_state_dict']):
         optimizer.load_state_dict(state_dict)
     return model, optimizers, epoch
+
+
+def file_logging(log_dir):
+#initialize logging
+    os.makedirs(log_dir, exist_ok = True)
+
+    logger = logging.getLogger("train Logging")
+    logger.setLevel(logging.DEBUG)
+
+    file_path = os.path.join(log_dir, 'train Logging.log')
+    file_logger = logging.FileHandler(file_path)
+    file_logger.setLevel(logging.DEBUG)
+
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s -%(message)s')
+    file_logger.setFormatter(formatter)
+
+    logger.addHandler(file_logger)
+
+    return logger
